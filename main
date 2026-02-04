@@ -1,0 +1,483 @@
+import tkinter as tk
+from tkinter import ttk, filedialog, messagebox
+import json
+import jsonschema
+from jsonschema.exceptions import ValidationError, best_match
+
+
+# --- Общие утилиты ---
+def _extract_key_from_path(path: str) -> str | None:
+    """Вытаскивает последний значимый ключ из JSON-пути вроде $.user.name → name"""
+    if not path or path == "$":
+        return None
+    parts = [p for p in path.split(".") if p and p != "$"]
+    if not parts:
+        return None
+    key = parts[-1].split("[")[0]
+    meta_keys = {"type", "required", "properties", "items", "enum", "allOf", "anyOf", "oneOf"}
+    if key in meta_keys and len(parts) >= 2:
+        key = parts[-2].split("[")[0]
+    return key or None
+
+
+def _highlight_in_widget(widget: tk.Text, key: str):
+    """Подсвечивает первую строку, где встречается ключ (грубая реализация)"""
+    for pattern in (f'"{key}"', key):
+        idx = widget.search(pattern, "1.0", tk.END)
+        if idx:
+            line = idx.split(".")[0]
+            widget.tag_add("hl", f"{line}.0", f"{line}.end")
+            widget.see(f"{line}.0")
+            return
+
+
+# --- Виджет с номерами строк ---
+class LineNumberedText(ttk.Frame):
+    def __init__(self, parent, wrap=tk.WORD):
+        super().__init__(parent)
+        self.text = tk.Text(self, wrap=wrap, undo=True, font=("Menlo", 11))
+        self.linenumbers = tk.Text(
+            self, width=4, padx=4, takefocus=0, border=0,
+            state="disabled", bg="#f0f0f0", fg="#808080"
+        )
+        self.vscroll = ttk.Scrollbar(self, orient="vertical", command=self._on_vscroll)
+
+        self.linenumbers.grid(row=0, column=0, sticky="ns")
+        self.text.grid(row=0, column=1, sticky="nsew")
+        self.vscroll.grid(row=0, column=2, sticky="ns")
+
+        self.columnconfigure(1, weight=1)
+        self.rowconfigure(0, weight=1)
+
+        self.text.configure(yscrollcommand=self._on_textscroll)
+        self.text.bind("<KeyRelease>", self._on_change)
+        self.text.bind("<ButtonRelease-1>", self._on_change)
+        self.text.bind("<MouseWheel>", self._on_change)
+        self._update_linenumbers()
+
+    def _on_vscroll(self, *args):
+        self.text.yview(*args)
+        self.linenumbers.yview(*args)
+
+    def _on_textscroll(self, *args):
+        self.vscroll.set(*args)
+        self.linenumbers.yview_moveto(args[0])
+
+    def _on_change(self, _event=None):
+        self._update_linenumbers()
+
+    def _update_linenumbers(self):
+        end_index = self.text.index("end-1c")
+        line_count = int(end_index.split(".")[0])
+        numbers = "\n".join(str(i) for i in range(1, line_count + 1)) + "\n"
+        self.linenumbers.config(state="normal")
+        self.linenumbers.delete("1.0", tk.END)
+        self.linenumbers.insert("1.0", numbers)
+        self.linenumbers.config(state="disabled")
+
+
+# --- Вкладка: Генерация / Проверка ---
+class SchemaToolsFrame(ttk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.current_schema = None
+        self.current_errors = []
+
+        top_frame = ttk.Frame(self)
+        top_frame.pack(fill=tk.X, pady=(0, 5))
+        self.schema_path_var = tk.StringVar()
+        ttk.Label(top_frame, text="Файл схемы:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(top_frame, textvariable=self.schema_path_var).grid(row=0, column=1, sticky="we", padx=5)
+        ttk.Button(top_frame, text="Открыть...", command=self.load_schema_from_file).grid(row=0, column=2)
+        top_frame.columnconfigure(1, weight=1)
+
+        paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        left_frame = ttk.Frame(paned)
+        right_frame = ttk.Frame(paned)
+        paned.add(left_frame, weight=1)
+        paned.add(right_frame, weight=1)
+
+        ttk.Label(left_frame, text="JSON Schema").pack(anchor=tk.W)
+        self.schema_text = LineNumberedText(left_frame)
+        self.schema_text.pack(fill=tk.BOTH, expand=True, padx=(0, 5), pady=5)
+        self.schema_text_widget = self.schema_text.text
+
+        ttk.Label(right_frame, text="Сообщение / Пример").pack(anchor=tk.W)
+        self.instance_text = LineNumberedText(right_frame)
+        self.instance_text.pack(fill=tk.BOTH, expand=True, padx=(5, 0), pady=5)
+        self.instance_text_widget = self.instance_text.text
+
+        self.schema_text_widget.tag_configure("hl", background="#fff8b3")
+        self.instance_text_widget.tag_configure("hl", background="#fff8b3")
+
+        btn_frame = ttk.Frame(self)
+        btn_frame.pack(fill=tk.X, pady=5)
+        ttk.Button(btn_frame, text="Сгенерировать пример", command=self.generate_example).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Проверить сообщение", command=self.validate).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btn_frame, text="Сохранить сообщение", command=self.save_instance).pack(side=tk.LEFT, padx=5)
+
+        error_frame = ttk.Frame(self)
+        error_frame.pack(fill=tk.BOTH, expand=True, pady=(8, 0))
+        ttk.Label(error_frame, text="Результат проверки:").pack(anchor=tk.W)
+        self.error_output = LineNumberedText(error_frame)
+        self.error_output.pack(fill=tk.BOTH, expand=True)
+        self.error_text = self.error_output.text
+        self.error_text.tag_configure("error", foreground="#8B0000")
+        self.error_text.tag_configure("info", foreground="#006400")
+
+    def load_schema_from_file(self):
+        path = filedialog.askopenfilename(
+            title="Выберите файл JSON схемы",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")]
+        )
+        if not path:
+            return
+        try:
+            with open(path, "r", encoding="utf-8") as f:
+                content = f.read()
+            self.schema_text_widget.delete("1.0", tk.END)
+            self.schema_text_widget.insert(tk.END, content)
+            self.schema_path_var.set(path)
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось прочитать файл:\n{e}")
+
+    def _resolve_ref(self, ref_path: str):
+        """Разрешает $ref внутри текущей схемы. Без защиты от циклов!"""
+        if not self.current_schema or not ref_path.startswith("#/"):
+            return None
+        parts = ref_path[2:].split("/")
+        current = self.current_schema
+        try:
+            for part in parts:
+                if part:
+                    # Декодирование ~1 → /, ~0 → ~ (RFC 6901)
+                    part = part.replace("~1", "/").replace("~0", "~")
+                    current = current[part]
+            return current
+        except (KeyError, TypeError):
+            return None
+
+    def _generate_from_schema(self, schema):
+        """Простой генератор примера. Не претендует на полноту."""
+        if isinstance(schema, dict) and "$ref" in schema:
+            resolved = self._resolve_ref(schema["$ref"])
+            if resolved is not None:
+                return self._generate_from_schema(resolved)
+            return {}
+
+        if isinstance(schema, dict):
+            if "const" in schema:
+                return schema["const"]
+            if "enum" in schema:
+                return schema["enum"][0] if schema["enum"] else None
+
+            # Поддержка anyOf/oneOf/allOf — только первый успешный вариант
+            for combiner in ("anyOf", "oneOf"):
+                if combiner in schema:
+                    for sub in schema[combiner]:
+                        try:
+                            return self._generate_from_schema(sub)
+                        except Exception:
+                            continue
+                    return {}
+            if "allOf" in schema:
+                result = {}
+                for sub in schema["allOf"]:
+                    val = self._generate_from_schema(sub)
+                    if isinstance(val, dict):
+                        result.update(val)
+                return result
+
+            schema_type = schema.get("type")
+            if schema_type == "object":
+                result = {}
+                props = schema.get("properties", {})
+                for k, v in props.items():
+                    result[k] = self._generate_from_schema(v)
+                return result
+
+            elif schema_type == "array":
+                item_schema = schema.get("items", {})
+                return [self._generate_from_schema(item_schema)]
+
+            elif schema_type == "string":
+                fmt = schema.get("format")
+                if fmt == "email":
+                    return "user@example.com"
+                elif fmt == "date-time":
+                    return "2023-01-01T12:00:00Z"
+                elif fmt == "date":
+                    return "2023-01-01"
+                elif fmt == "uri":
+                    return "https://example.com"
+                elif fmt == "uuid":
+                    return "a1b2c3d4-e5f6-7890-g1h2-i3j4k5l6m7n8"
+                return "example_string"
+
+            elif schema_type == "number":
+                return 42.5
+            elif schema_type == "integer":
+                return 42
+            elif schema_type == "boolean":
+                return True
+            elif schema_type == "null":
+                return None
+
+        return {}  # fallback
+
+    def generate_example(self):
+        schema_str = self.schema_text_widget.get("1.0", tk.END).strip()
+        if not schema_str:
+            messagebox.showwarning("Ошибка", "Введите или загрузите схему.")
+            return
+        try:
+            schema = json.loads(schema_str)
+            self.current_schema = schema
+            example = self._generate_from_schema(schema)
+            self.instance_text_widget.delete("1.0", tk.END)
+            self.instance_text_widget.insert(tk.END, json.dumps(example, indent=2, ensure_ascii=False))
+        except Exception as e:
+            messagebox.showerror("Ошибка", f"Не удалось сгенерировать пример:\n{e}")
+
+    def validate(self):
+        schema_str = self.schema_text_widget.get("1.0", tk.END).strip()
+        instance_str = self.instance_text_widget.get("1.0", tk.END).strip()
+        if not schema_str or not instance_str:
+            messagebox.showwarning("Ошибка", "Заполните оба поля.")
+            return
+
+        try:
+            schema = json.loads(schema_str)
+            instance = json.loads(instance_str)
+        except json.JSONDecodeError as e:
+            messagebox.showerror("JSON ошибка", str(e))
+            return
+
+        try:
+            jsonschema.validate(instance=instance, schema=schema)
+            self.current_errors = []
+            self._render_errors([("info", "$", "Сообщение соответствует схеме.")])
+            messagebox.showinfo("OK", "Соответствует схеме!")
+        except ValidationError:
+            validator = jsonschema.Draft7Validator(schema)
+            errors = list(validator.iter_errors(instance))
+            error_entries = []
+            for err in errors:
+                path = "$." + ".".join(str(x) for x in err.absolute_path) if err.absolute_path else "$"
+                error_entries.append(("error", path, err.message))
+            self.current_errors = error_entries
+            self._render_errors(error_entries)
+
+            best = best_match(errors)
+            msg = f"Ошибка: {best.message}\nПуть: {' → '.join(str(p) for p in best.absolute_path) if best.absolute_path else 'корень'}"
+            messagebox.showerror("Валидация", msg)
+
+    def _render_errors(self, errors):
+        self.error_text.delete("1.0", tk.END)
+        for i, (kind, path, msg) in enumerate(errors, 1):
+            line = f"{i:3}. [{kind.upper()}] {path}: {msg}\n"
+            self.error_text.insert(tk.END, line, kind)
+            tag = f"err_{i}"
+            self.error_text.tag_add(tag, f"{i}.0", f"{i}.end")
+            self.error_text.tag_bind(tag, "<Button-1>", lambda e, idx=i-1: self.on_error_click(idx))
+
+    def on_error_click(self, index):
+        if not (0 <= index < len(self.current_errors)):
+            return
+        _, path, _ = self.current_errors[index]
+        key = _extract_key_from_path(path)
+        if key:
+            self.instance_text_widget.tag_remove("hl", "1.0", tk.END)
+            self.schema_text_widget.tag_remove("hl", "1.0", tk.END)
+            _highlight_in_widget(self.instance_text_widget, key)
+            _highlight_in_widget(self.schema_text_widget, key)
+
+    def save_instance(self):
+        content = self.instance_text_widget.get("1.0", tk.END).strip()
+        if not content:
+            messagebox.showwarning("Ошибка", "Нет данных для сохранения.")
+            return
+        path = filedialog.asksaveasfilename(
+            defaultextension=".json",
+            filetypes=[("JSON files", "*.json"), ("All files", "*.*")],
+            title="Сохранить как"
+        )
+        if path:
+            try:
+                with open(path, "w", encoding="utf-8") as f:
+                    f.write(content)
+                messagebox.showinfo("Сохранено", f"Файл сохранён: {path}")
+            except Exception as e:
+                messagebox.showerror("Ошибка", str(e))
+
+
+# --- Вкладка: Сравнение схем ---
+class SchemaDiffFrame(ttk.Frame):
+    def __init__(self, parent):
+        super().__init__(parent)
+        self.current_diffs = []
+
+        top = ttk.Frame(self)
+        top.pack(fill=tk.X, pady=5)
+        self.left_path_var = tk.StringVar()
+        self.right_path_var = tk.StringVar()
+
+        ttk.Label(top, text="Схема 1:").grid(row=0, column=0, sticky="w")
+        ttk.Entry(top, textvariable=self.left_path_var, width=40).grid(row=0, column=1, sticky="we", padx=5)
+        ttk.Button(top, text="Открыть...", command=self.load_left).grid(row=0, column=2, padx=5)
+
+        ttk.Label(top, text="Схема 2:").grid(row=0, column=3, sticky="w")
+        ttk.Entry(top, textvariable=self.right_path_var, width=40).grid(row=0, column=4, sticky="we", padx=5)
+        ttk.Button(top, text="Открыть...", command=self.load_right).grid(row=0, column=5, padx=5)
+
+        top.columnconfigure(1, weight=1)
+        top.columnconfigure(4, weight=1)
+
+        paned = ttk.PanedWindow(self, orient=tk.HORIZONTAL)
+        paned.pack(fill=tk.BOTH, expand=True, pady=5)
+
+        left_f = ttk.Frame(paned)
+        right_f = ttk.Frame(paned)
+        paned.add(left_f, weight=1)
+        paned.add(right_f, weight=1)
+
+        ttk.Label(left_f, text="Схема 1").pack(anchor=tk.W)
+        self.left_text_w = LineNumberedText(left_f)
+        self.left_text_w.pack(fill=tk.BOTH, expand=True, padx=(0, 5), pady=5)
+        self.left_text = self.left_text_w.text
+
+        ttk.Label(right_f, text="Схема 2").pack(anchor=tk.W)
+        self.right_text_w = LineNumberedText(right_f)
+        self.right_text_w.pack(fill=tk.BOTH, expand=True, padx=(5, 0), pady=5)
+        self.right_text = self.right_text_w.text
+
+        self.left_text.tag_configure("hl", background="#fff8b3")
+        self.right_text.tag_configure("hl", background="#fff8b3")
+
+        btns = ttk.Frame(self)
+        btns.pack(fill=tk.X, pady=5)
+        ttk.Button(btns, text="Сравнить схемы", command=self.compare_schemas).pack(side=tk.LEFT, padx=5)
+        ttk.Button(btns, text="Копировать результат", command=self.copy_diff).pack(side=tk.LEFT, padx=5)
+
+        diff_f = ttk.Frame(self)
+        diff_f.pack(fill=tk.BOTH, expand=True, pady=(5, 0))
+        ttk.Label(diff_f, text="Отличия:").pack(anchor=tk.W)
+        self.diff_output = LineNumberedText(diff_f)
+        self.diff_output.pack(fill=tk.BOTH, expand=True)
+        self.diff_text = self.diff_output.text
+        self.diff_text.tag_configure("added", foreground="#006400")
+        self.diff_text.tag_configure("removed", foreground="#8B0000")
+        self.diff_text.tag_configure("changed", foreground="#8B4513")
+        self.diff_text.tag_configure("info", foreground="#000080")
+
+    def load_left(self):
+        self._load_file(self.left_path_var, self.left_text)
+
+    def load_right(self):
+        self._load_file(self.right_path_var, self.right_text)
+
+    def _load_file(self, var, widget):
+        path = filedialog.askopenfilename(filetypes=[("JSON files", "*.json")])
+        if path:
+            var.set(path)
+            try:
+                with open(path, "r", encoding="utf-8") as f:
+                    widget.delete("1.0", tk.END)
+                    widget.insert(tk.END, f.read())
+            except Exception as e:
+                messagebox.showerror("Ошибка", str(e))
+
+    def compare_schemas(self):
+        try:
+            left = json.loads(self.left_text.get("1.0", tk.END))
+            right = json.loads(self.right_text.get("1.0", tk.END))
+        except json.JSONDecodeError as e:
+            messagebox.showerror("Ошибка", f"Некорректный JSON:\n{e}")
+            return
+
+        diffs = []
+        self._compare_recursive(left, right, "$", diffs)
+        self.current_diffs = diffs
+        self._render_diffs(diffs)
+
+    def _compare_recursive(self, a, b, path, diffs):
+        if type(a) != type(b):
+            diffs.append(("changed", path, f"Тип изменился: {type(a).__name__} → {type(b).__name__}"))
+            return
+
+        if isinstance(a, dict):
+            ka, kb = set(a.keys()), set(b.keys())
+            for k in sorted(ka - kb):
+                diffs.append(("removed", f"{path}.{k}", f"Ключ '{k}' удалён"))
+            for k in sorted(kb - ka):
+                diffs.append(("added", f"{path}.{k}", f"Ключ '{k}' добавлен"))
+            for k in sorted(ka & kb):
+                self._compare_recursive(a[k], b[k], f"{path}.{k}", diffs)
+        elif isinstance(a, list):
+            for i in range(max(len(a), len(b))):
+                p = f"{path}[{i}]"
+                if i >= len(a):
+                    diffs.append(("added", p, f"Добавлен элемент: {b[i]}"))
+                elif i >= len(b):
+                    diffs.append(("removed", p, f"Удалён элемент: {a[i]}"))
+                else:
+                    self._compare_recursive(a[i], b[i], p, diffs)
+        else:
+            if a != b:
+                diffs.append(("changed", path, f"Значение: {a!r} → {b!r}"))
+
+    def _render_diffs(self, diffs):
+        self.diff_text.delete("1.0", tk.END)
+        if not diffs:
+            self.diff_text.insert(tk.END, "Схемы идентичны.\n", "info")
+            return
+        for i, (kind, path, msg) in enumerate(diffs, 1):
+            line = f"{i:3}. [{kind.upper()}] {path}: {msg}\n"
+            self.diff_text.insert(tk.END, line, kind)
+            tag = f"diff_{i}"
+            self.diff_text.tag_add(tag, f"{i}.0", f"{i}.end")
+            self.diff_text.tag_bind(tag, "<Button-1>", lambda e, idx=i-1: self.on_diff_click(idx))
+
+    def copy_diff(self):
+        text = self.diff_text.get("1.0", tk.END).strip()
+        if text:
+            self.clipboard_clear()
+            self.clipboard_append(text)
+            messagebox.showinfo("Копирование", "Результат скопирован в буфер обмена.")
+
+    def on_diff_click(self, index):
+        if not (0 <= index < len(self.current_diffs)):
+            return
+        kind, path, _ = self.current_diffs[index]
+        key = _extract_key_from_path(path)
+        if key:
+            self.left_text.tag_remove("hl", "1.0", tk.END)
+            self.right_text.tag_remove("hl", "1.0", tk.END)
+            if kind == "added":
+                _highlight_in_widget(self.right_text, key)
+            elif kind == "removed":
+                _highlight_in_widget(self.left_text, key)
+            else:
+                _highlight_in_widget(self.left_text, key)
+                _highlight_in_widget(self.right_text, key)
+
+
+# --- Запуск ---
+def main():
+    root = tk.Tk()
+    root.title("JSON Schema Helper")
+    root.geometry("1200x800")
+
+    notebook = ttk.Notebook(root)
+    notebook.pack(fill=tk.BOTH, expand=True)
+
+    notebook.add(SchemaToolsFrame(notebook), text="Генерация / Проверка")
+    notebook.add(SchemaDiffFrame(notebook), text="Сравнение схем")
+
+    root.mainloop()
+
+
+if __name__ == "__main__":
+    main()
